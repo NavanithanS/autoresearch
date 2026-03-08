@@ -56,10 +56,36 @@ Because throughput is lower on Apple Silicon, **`val_bpb` results are not direct
 # Fewer shards to keep prep fast on laptop storage
 uv run prepare.py --num-shards 8 --download-workers 4
 
-# Reduce batch size if you hit memory pressure (default is 128)
+# Reduce batch size if you hit memory pressure (see batch size guidance below)
 # Edit DEVICE_BATCH_SIZE in train.py before running
 uv run train.py
 ```
+
+#### Batch size on MPS
+
+`DEVICE_BATCH_SIZE=128` (the H100 default) requires ~8 GB just for attention scores when using an explicit sliding-window mask — which exceeds MPS headroom. Start conservatively:
+
+| Use case | `DEVICE_BATCH_SIZE` | `TOTAL_BATCH_SIZE` | `grad_accum` |
+|---|---|---|---|
+| Smoke test / CPU | `1` | `2048` | `1` |
+| MPS development | `8` | `2**19` | `32` |
+| H100 full run | `128` | `2**19` | `2` |
+
+#### MPS optimizer compatibility fixes (March 2026)
+
+The MuonAdamW optimizer was originally written and tuned for CUDA with `torch.compile`. Running it on MPS required three categories of fixes, all merged into `train.py`:
+
+**1. Optimizer scalar tensors on the wrong device**
+
+The 0-D scalar tensors used to pass hyperparameters (`lr`, `beta1`, `beta2`, etc.) into the step functions were hardcoded to `device="cpu"`. CUDA accepts cross-device scalar arguments; MPS does not (`lerp_` aborts with a device mismatch). Fixed by routing scalars to `_device` on MPS/CPU and keeping them on CPU only for CUDA (where `torch.compile` requires it to avoid recompilation).
+
+**2. bf16/f32 dtype mismatches in `adamw_step_fused`**
+
+`wte` and `value_embeds` are explicitly stored in `bfloat16` (`EMBED_DTYPE`). When `adamw_step_fused` does in-place operations on those parameters, all intermediate f32 scalar tensors must first be cast to `p.dtype`. MPS enforces strict same-dtype element types for every kernel; CUDA promotes silently. Fixed by casting every scalar expression to `dt = p.dtype` before any in-place op (`p.mul_`, `exp_avg.lerp_`, `exp_avg_sq.lerp_`, the denom divide, and the final `p.add_`).
+
+**3. bf16/f32 mismatch in `muon_step_fused` after polar express**
+
+Polar express orthogonalization casts `g` to `bfloat16` internally (`X = g.bfloat16()`) for speed, then reassigns `g = X`. All subsequent operations — NorMuon variance reduction, `second_momentum_buffer.lerp_`, and the final parameter update — inherit that bf16 dtype and conflict with the f32 `stacked_params` and `second_momentum_buffer`. Fixed by converting back to `stacked_params.dtype` immediately after polar express (`g = X.to(stacked_params.dtype)`) and casting `beta2` to `second_momentum_buffer.dtype` rather than `g.dtype`.
 
 ## Running the agent
 

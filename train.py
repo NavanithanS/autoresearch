@@ -340,14 +340,17 @@ polar_express_coeffs = [
 ]
 
 def adamw_step_fused(p, grad, exp_avg, exp_avg_sq, step_t, lr_t, beta1_t, beta2_t, eps_t, wd_t):
-    p.mul_(1 - lr_t * wd_t)
-    exp_avg.lerp_(grad, 1 - beta1_t)
-    exp_avg_sq.lerp_(grad.square(), 1 - beta2_t)
+    # Cast f32 scalar tensors to p.dtype for in-place ops — MPS requires uniform dtypes.
+    # (wte/value_embeds are bf16; torch.compile on CUDA makes .to(dtype) a no-op when already matching.)
+    dt = p.dtype
+    p.mul_((1 - lr_t * wd_t).to(dt))
+    exp_avg.lerp_(grad, (1 - beta1_t).to(dt))
+    exp_avg_sq.lerp_(grad.square(), (1 - beta2_t).to(dt))
     bias1 = 1 - beta1_t ** step_t
     bias2 = 1 - beta2_t ** step_t
-    denom = (exp_avg_sq / bias2).sqrt() + eps_t
-    step_size = lr_t / bias1
-    p.add_(exp_avg / denom, alpha=-step_size)
+    denom = (exp_avg_sq / bias2.to(dt)).sqrt() + eps_t.to(dt)
+    step_size = (lr_t / bias1).to(dt)
+    p.add_(exp_avg / denom * -step_size)
 
 def muon_step_fused(stacked_grads, stacked_params, momentum_buffer, second_momentum_buffer,
                     momentum_t, lr_t, wd_t, beta2_t, ns_steps, red_dim):
@@ -368,14 +371,17 @@ def muon_step_fused(stacked_grads, stacked_params, momentum_buffer, second_momen
             A = X @ X.mT
             B = b * A + c * (A @ A)
             X = a * X + B @ X
-    g = X
+    # Convert back to stacked_params dtype (f32) after bf16 polar express.
+    # MPS requires uniform dtypes; CUDA handles the promotion silently.
+    g = X.to(stacked_params.dtype)
     # NorMuon variance reduction
-    beta2 = beta2_t.to(g.dtype)
+    buf_dt = second_momentum_buffer.dtype
+    beta2 = beta2_t.to(buf_dt)
     v_mean = g.float().square().mean(dim=red_dim, keepdim=True)
     red_dim_size = g.size(red_dim)
     v_norm_sq = v_mean.sum(dim=(-2, -1), keepdim=True) * red_dim_size
     v_norm = v_norm_sq.sqrt()
-    second_momentum_buffer.lerp_(v_mean.to(dtype=second_momentum_buffer.dtype), 1 - beta2)
+    second_momentum_buffer.lerp_(v_mean.to(dtype=buf_dt), 1 - beta2)
     step_size = second_momentum_buffer.clamp_min(1e-10).rsqrt()
     scaled_sq_sum = (v_mean * red_dim_size) * step_size.float().square()
     v_norm_new = scaled_sq_sum.sum(dim=(-2, -1), keepdim=True).sqrt()
@@ -393,17 +399,19 @@ class MuonAdamW(torch.optim.Optimizer):
 
     def __init__(self, param_groups):
         super().__init__(param_groups, defaults={})
-        # 0-D CPU tensors to avoid torch.compile recompilation when values change
-        self._adamw_step_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
-        self._adamw_lr_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
-        self._adamw_beta1_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
-        self._adamw_beta2_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
-        self._adamw_eps_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
-        self._adamw_wd_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
-        self._muon_momentum_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
-        self._muon_lr_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
-        self._muon_wd_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
-        self._muon_beta2_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
+        # 0-D tensors to avoid torch.compile recompilation when values change.
+        # Must be on the model device — MPS does not allow cross-device ops like lerp_.
+        _scalar_dev = "cpu" if _device_type == "cuda" else _device
+        self._adamw_step_t = torch.tensor(0.0, dtype=torch.float32, device=_scalar_dev)
+        self._adamw_lr_t = torch.tensor(0.0, dtype=torch.float32, device=_scalar_dev)
+        self._adamw_beta1_t = torch.tensor(0.0, dtype=torch.float32, device=_scalar_dev)
+        self._adamw_beta2_t = torch.tensor(0.0, dtype=torch.float32, device=_scalar_dev)
+        self._adamw_eps_t = torch.tensor(0.0, dtype=torch.float32, device=_scalar_dev)
+        self._adamw_wd_t = torch.tensor(0.0, dtype=torch.float32, device=_scalar_dev)
+        self._muon_momentum_t = torch.tensor(0.0, dtype=torch.float32, device=_scalar_dev)
+        self._muon_lr_t = torch.tensor(0.0, dtype=torch.float32, device=_scalar_dev)
+        self._muon_wd_t = torch.tensor(0.0, dtype=torch.float32, device=_scalar_dev)
+        self._muon_beta2_t = torch.tensor(0.0, dtype=torch.float32, device=_scalar_dev)
 
     def _step_adamw(self, group):
         for p in group['params']:
@@ -474,7 +482,7 @@ HEAD_DIM = 128          # target head dimension for attention
 WINDOW_PATTERN = "SSSL" # sliding window pattern: L=full, S=half context
 
 # Optimization
-TOTAL_BATCH_SIZE = 2**19 # ~524K tokens per optimizer step
+TOTAL_BATCH_SIZE = 2048  # 1 seq × 2048 tokens → grad_accum=1 (set to 2**19 for real runs)
 EMBEDDING_LR = 0.6      # learning rate for token embeddings (Adam)
 UNEMBEDDING_LR = 0.004  # learning rate for lm_head (Adam)
 MATRIX_LR = 0.04        # learning rate for matrix parameters (Muon)
@@ -486,8 +494,8 @@ WARMDOWN_RATIO = 0.5    # fraction of time budget for LR warmdown
 FINAL_LR_FRAC = 0.0     # final LR as fraction of initial
 
 # Model size
-DEPTH = 8               # number of transformer layers
-DEVICE_BATCH_SIZE = 128  # per-device batch size (reduce if OOM)
+DEPTH = 4               # number of transformer layers (4→256-dim/2-head, 8→512-dim/4-head)
+DEVICE_BATCH_SIZE = 1   # per-device batch size; keep at 1 for CPU/MPS smoke tests
 
 # ---------------------------------------------------------------------------
 # Setup: tokenizer, model, optimizer, dataloader
