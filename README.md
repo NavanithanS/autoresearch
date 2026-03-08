@@ -18,10 +18,11 @@ By design, training runs for a **fixed 5-minute time budget** (wall clock, exclu
 
 ## Quick start
 
-**Requirements:** A single NVIDIA GPU (tested on H100), Python 3.10+, [uv](https://docs.astral.sh/uv/).
+**Requirements:** Python 3.10+, [uv](https://docs.astral.sh/uv/), and one of:
+- **NVIDIA GPU** (H100 recommended) — full performance with Flash Attention 3 and `torch.compile`
+- **Apple Silicon Mac** (M1/M2/M3/M4) — runs via PyTorch MPS backend (~3–5× slower throughput than H100, but fully functional)
 
 ```bash
-
 # 1. Install uv project manager (if you don't already have it)
 curl -LsSf https://astral.sh/uv/install.sh | sh
 
@@ -37,7 +38,28 @@ uv run train.py
 
 If the above commands all work ok, your setup is working and you can go into autonomous research mode.
 
-**Platforms support**. This code currently requires that you have a single NVIDIA GPU. In principle it is quite possible to support CPU, MPS and other platforms but this would also bloat the code. I'm not 100% sure that I want to take this on personally right now. The code is just a demonstration and I don't know how much I'll support it going forward. People can reference (or have their agents reference) the full/parent nanochat repository that has wider platform support and shows the various solutions (e.g. a Flash Attention 3 kernels fallback implementation, generic device support, autodetection, etc.), feel free to create forks or discussions for other platforms and I'm happy to link to them here in the README in some new notable forks section or etc.
+### Apple Silicon (MPS) notes
+
+The codebase auto-detects the available device at startup (`cuda → mps → cpu`). On Apple Silicon, the following differences apply automatically — no flags or config changes needed:
+
+| Feature | CUDA (H100) | Apple Silicon (MPS) |
+|---|---|---|
+| Attention kernel | Flash Attention 3 | `F.scaled_dot_product_attention` |
+| `torch.compile` | ✅ Enabled | ❌ Disabled (MPS inductor unsupported) |
+| Mixed precision | bfloat16 autocast | fp32 (embeddings stay bfloat16) |
+| Memory tracking | `cuda.max_memory_allocated` | Running max of `mps.driver_allocated_memory` |
+| MFU reference | H100 BF16 (989.5 TFLOPS) | M4 Max GPU FP16 (~14.2 TFLOPS) |
+
+Because throughput is lower on Apple Silicon, **`val_bpb` results are not directly comparable between CUDA and MPS runs** — each platform should establish its own baseline. The recommended Apple Silicon setup for the experiment loop:
+
+```bash
+# Fewer shards to keep prep fast on laptop storage
+uv run prepare.py --num-shards 8 --download-workers 4
+
+# Reduce batch size if you hit memory pressure (default is 128)
+# Edit DEVICE_BATCH_SIZE in train.py before running
+uv run train.py
+```
 
 ## Running the agent
 
@@ -67,6 +89,10 @@ pyproject.toml  — dependencies
 ## Notable forks
 
 - [miolini/autoresearch-macos](https://github.com/miolini/autoresearch-macos)
+
+## Platform research
+
+See [`mlx-feasibility.md`](mlx-feasibility.md) for a detailed analysis of porting options for Apple Silicon, including a comparison of MLX-native, hybrid, and PyTorch/MPS approaches with pros/cons for each.
 
 ## License
 
